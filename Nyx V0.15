@@ -1,0 +1,1168 @@
+// AI Nyx V0.15 — Phase 1 
+// cTrader cAlgo C# Robot
+
+using System;
+using System.Linq;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Globalization;
+using cAlgo;
+using cAlgo.API;
+using cAlgo.API.Indicators;
+using cAlgo.Indicators; // KNNFeaturePack_25
+
+namespace cAlgo.Robots
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class AINyxV015 : Robot
+    {
+        private const int FeatureDim = 25;
+        private const double RefRffDim = 48.0;
+
+        // ===== Strategy =====
+        [Parameter("Label", Group = "Strategy", DefaultValue = "Myelin")]
+        public string Label { get; set; }
+
+        [Parameter("Horizon H (bars)", Group = "Strategy", DefaultValue = 12, MinValue = 6, MaxValue = 96, Step = 6)]
+        public int HorizonBars { get; set; }
+
+        // ===== Model =====
+        [Parameter("RFF Dim D", Group = "Model", DefaultValue = 48, MinValue = 16, MaxValue = 128, Step = 16)]
+        public int RffDim { get; set; }
+
+        [Parameter("Ensemble Size", Group = "Model", DefaultValue = 5, MinValue = 3, MaxValue = 9)]
+        public int EnsembleSize { get; set; }
+
+        [Parameter("Subspace k (features)", Group = "Model", DefaultValue = 9, MinValue = 4, MaxValue = FeatureDim)]
+        public int SubspaceK { get; set; }
+
+        [Parameter("RFF Sigmas CSV", Group = "Model", DefaultValue = "0.5,1.0,2.0")]
+        public string RffSigmasCsv { get; set; }
+
+        [Parameter("Base Seed", Group = "Model", DefaultValue = 1337, MinValue = 1337, MaxValue = 1337)]
+        public int Seed { get; set; }
+
+        // ===== Learning =====
+        [Parameter("Learning Rate", Group = "Learning", DefaultValue = 0.08, MinValue = 0.01, MaxValue = 0.20)]
+        public double Lr { get; set; }
+
+        [Parameter("L2 Lambda (Decay)", Group = "Learning", DefaultValue = 1e-4, MinValue = 0.0, MaxValue = 0.01)]
+        public double Lambda { get; set; }
+
+        [Parameter("Updates/Label", Group = "Learning", DefaultValue = 3, MinValue = 1, MaxValue = 7, Step = 2)]
+        public int UpdatesPerLabel { get; set; }
+
+        [Parameter("Cold Updates (no margin)", Group = "Learning", DefaultValue = 250, MinValue = 50, MaxValue = 1000, Step = 50)]
+        public int ColdUpdates { get; set; }
+
+        [Parameter("HL Forget (bars)", Group = "Learning", DefaultValue = 2000, MinValue = 100, MaxValue = 20000)]
+        public int HLForget { get; set; }
+
+        [Parameter("Grad Clip (L2)", Group = "Learning", DefaultValue = 5.0, MinValue = 0.5, MaxValue = 50.0)]
+        public double GradClip { get; set; }
+
+        // TempCalib + Adam
+        private readonly double TempInit = 1.00, TempLr = 0.01, TempTmin = 0.5, TempTmax = 3.0;
+        private readonly double AdamB1 = 0.9, AdamB2 = 0.999, AdamEps = 1e-8;
+
+        // ===== Triple-Barrier =====
+        [Parameter("TB Up x ATR", Group = "Labels", DefaultValue = 1.2, MinValue = 0.4, MaxValue = 4.0)]
+        public double TbUpAtr { get; set; }
+
+        [Parameter("TB Down x ATR", Group = "Labels", DefaultValue = 1.2, MinValue = 0.4, MaxValue = 4.0)]
+        public double TbDnAtr { get; set; }
+
+        [Parameter("TB Hmax (bars)", Group = "Labels", DefaultValue = 24, MinValue = 6, MaxValue = 192, Step = 6)]
+        public int TbHmax { get; set; }
+
+        [Parameter("TB Skip On Expire", Group = "Labels", DefaultValue = true)]
+        public bool TbSkipOnExpire { get; set; }
+
+        // ===== Pondération / Aggrégat =====
+        [Parameter("HL Weights (bars)", Group = "Model", DefaultValue = 500, MinValue = 50, MaxValue = 5000)]
+        public int HLWeights { get; set; }
+
+        [Parameter("Tau Softmax", Group = "Model", DefaultValue = 0.15, MinValue = 0.05, MaxValue = 0.50)]
+        public double TauW { get; set; }
+
+        [Parameter("ColdStart Labels", Group = "Model", DefaultValue = 50, MinValue = 10, MaxValue = 300)]
+        public int ColdStartLabels { get; set; }
+
+        // ===== Sélectivité =====
+        [Parameter("EdgeTopFrac (top X%)", Group = "Selectivity", DefaultValue = 0.30, MinValue = 0.05, MaxValue = 0.60, Step = 0.01)]
+        public double EdgeTopFrac { get; set; }
+
+        [Parameter("Edge Window (bars)", Group = "Selectivity", DefaultValue = 1000, MinValue = 200, MaxValue = 4000, Step = 50)]
+        public int EdgeWindow { get; set; }
+
+        // ===== Incertitude (gates) =====
+        [Parameter("Max Var(p_cal)", Group = "Uncertainty", DefaultValue = 0.025, MinValue = 0.001, MaxValue = 0.06)]
+        public double MaxVarP { get; set; }
+
+        [Parameter("Consensus k-of-n", Group = "Uncertainty", DefaultValue = 2, MinValue = 1, MaxValue = 9)]
+        public int ConsensusK { get; set; }
+
+        [Parameter("Max Entropy", Group = "Uncertainty", DefaultValue = 0.75, MinValue = 0.4, MaxValue = 0.95)]
+        public double MaxEntropy { get; set; }
+
+        // ===== Exécution & filtres =====
+        [Parameter("Decision Margin (p-0.5)", Group = "Execution", DefaultValue = 0.12, MinValue = 0.05, MaxValue = 0.40)]
+        public double Margin { get; set; }
+
+        [Parameter("Max Spread/ATR", Group = "Execution", DefaultValue = 0.35, MinValue = 0.05, MaxValue = 1.00)]
+        public double MaxSpreadToAtr { get; set; }
+
+        [Parameter("Cooldown bars", Group = "Execution", DefaultValue = 4, MinValue = 1, MaxValue = 20, Step = 1)]
+        public int CooldownBars { get; set; }
+
+        [Parameter("EV Gate α (R)", Group = "Execution", DefaultValue = 0.05, MinValue = 0.0, MaxValue = 0.5)]
+        public double EvGateAlphaR { get; set; }
+
+        [Parameter("Fees Roundtrip (pips)", Group = "Execution", DefaultValue = 0.0, MinValue = 0.0, MaxValue = 50.0)]
+        public double FeesPipsRoundtrip { get; set; }
+
+        [Parameter("Slippage/Side (pips)", Group = "Execution", DefaultValue = 0.25, MinValue = 0.0, MaxValue = 10.0)]
+        public double SlipPipsPerSide { get; set; }
+
+        [Parameter("Replace Epsilon", Group = "Execution", DefaultValue = 0.03, MinValue = 0.00, MaxValue = 0.10)]
+        public double ReplaceEps { get; set; }
+
+        // ===== Risk =====
+        [Parameter("SL = ATR x", Group = "Risk", DefaultValue = 1.8, MinValue = 1.0, MaxValue = 3.0)]
+        public double SlAtrMult { get; set; }
+
+        [Parameter("TP / SL", Group = "Risk", DefaultValue = 1.5, MinValue = 1.0, MaxValue = 3.0)]
+        public double TpOverSl { get; set; }
+
+        [Parameter("Risk per Trade (%)", Group = "Risk", DefaultValue = 0.30, MinValue = 0.05, MaxValue = 5.0)]
+        public double RiskPercent { get; set; }
+
+        [Parameter("Max Open Positions", Group = "Risk", DefaultValue = 3, MinValue = 1, MaxValue = 10, Step = 1)]
+        public int MaxOpenPositions { get; set; }
+
+        [Parameter("Enable Partial TP at 1R", Group = "Risk", DefaultValue = true)]
+        public bool EnablePartialTP1R { get; set; }
+
+        [Parameter("Max Position Age (bars)", Group = "Risk", DefaultValue = 24, MinValue = 6, MaxValue = 200, Step = 2)]
+        public int MaxPosBars { get; set; }
+
+        [Parameter("Enable Confidence Sizing", Group = "Risk", DefaultValue = true)]
+        public bool EnableConfSizing { get; set; }
+
+        [Parameter("Sizing r_min (%)", Group = "Risk", DefaultValue = 0.10, MinValue = 0.01, MaxValue = 2.0)]
+        public double SizingRMinPct { get; set; }
+
+        [Parameter("Sizing r_max (%)", Group = "Risk", DefaultValue = 0.50, MinValue = 0.02, MaxValue = 5.0)]
+        public double SizingRMaxPct { get; set; }
+
+        [Parameter("Sizing Score Max", Group = "Risk", DefaultValue = 0.45, MinValue = 0.10, MaxValue = 0.49)]
+        public double SizingScoreMax { get; set; }
+
+        // ===== Config & Log =====
+        [Parameter("ATR Period", Group = "Config", DefaultValue = 14, MinValue = 5, MaxValue = 100, Step = 1)]
+        public int AtrPeriod { get; set; }
+
+        [Parameter("Warmup Bars", Group = "Config", DefaultValue = 300, MinValue = 100, MaxValue = 4000, Step = 50)]
+        public int WarmupBars { get; set; }
+
+        [Parameter("Scaler Half-Life (bars)", Group = "Config", DefaultValue = 500, MinValue = 50, MaxValue = 5000, Step = 50)]
+        public int ScalerHalfLife { get; set; }
+
+        [Parameter("Log Every N Bars", Group = "Log", DefaultValue = 0, MinValue = 0, MaxValue = 100, Step = 1)]
+        public int LogEveryNBars { get; set; }
+
+        [Parameter("Log Probabilities", Group = "Log", DefaultValue = true)]
+        public bool LogProba { get; set; }
+
+        // ===== Internes =====
+        private AverageTrueRange _atr;
+        private KNNFeaturePack_25 _fp;
+        private EwmaScaler _scaler;
+
+        private double _alphaW, _alphaForget;
+        private long _blkSpread, _blkCooldown, _blkMargin, _blkWarm, _blkMax, _blkVol, _blkEV;
+        private long _ordBuy, _ordSell, _ordFail;
+        private long _modelHit, _modelExpired, _modelSkipped;
+        private int _lastTradeBar = -1;
+        private double _lastStrengthForOpen = 0.0;
+
+        private readonly Dictionary<long, Meta> _meta = new Dictionary<long, Meta>();
+        private Queue<PendingTB> _tbq;
+
+        private List<EnsembleSpec> _specs;
+        private List<ModelState> _ms;
+
+        // === AUC tracking ===
+        private sealed class Sample { public double P; public int Y; public DateTime T; public int Bar; }
+        private readonly List<Sample> _samples = new List<Sample>(1 << 16);
+        private sealed class PendingH { public int Tdec; public double P; public PendingH(int t, double p) { Tdec = t; P = p; } }
+        private readonly Queue<PendingH> _hq = new Queue<PendingH>(1 << 17);
+        private const int AUC_BINS = 100;
+        private double _aucEma = 0.5;
+
+        // === Edge history ===
+        private readonly List<double> _edgeHist = new List<double>(4096);
+
+        // === Trades (pour logs homogènes) ===
+        private sealed class TradeRec { public DateTime Open, Close; public double NetProfit; public string MonthKey; }
+        private readonly List<TradeRec> _trades = new List<TradeRec>();
+        private double _cumPnL, _peakPnL, _maxDD, _eq0;
+
+        private struct Meta
+        {
+            public int EntryBar;
+            public double InitSlPips;
+            public bool BeDone;
+            public double MaxR;
+            public bool TookTP1;
+            public double StrengthAtOpen;
+            public double RiskAtOpenUsd;
+            public double SpreadAtOpenPx;
+        }
+
+        private struct PendingTB
+        {
+            public double[][] ZtList;
+            public double[] Slist;
+            public double[] PcalList;
+            public double Up;
+            public double Dn;
+            public int Expire;
+            public int DecisionBar;
+            public bool Done;
+        }
+
+        internal sealed class EnsembleSpec
+        {
+            public int[] FeatIdx;
+            public double Sigma;
+            public double Lr, L2;
+            public int Seed;
+            public int Ksub;
+        }
+
+        internal sealed class ModelState
+        {
+            public OnlineRffLogit M;
+            public TempCalibrator Cal;
+            public int[] FeatIdx;
+            public double Sigma;
+            public int Ksub;
+            public double BrierEma = 0.25;
+            public double EvEma = 0.0;
+            public int LabelsSeen = 0;
+        }
+
+        private void Err(string msg) { Print("[ERR] " + msg); }
+
+        // ===== Lifecycle =====
+        protected override void OnStart()
+        {
+            _tbq = new Queue<PendingTB>(8192);
+
+            _atr = Indicators.AverageTrueRange(AtrPeriod, MovingAverageType.Exponential);
+            _fp = Indicators.GetIndicator<KNNFeaturePack_25>();
+            if (_fp == null) { Err("KNNFeaturePack_25 introuvable. Stop."); Stop(); return; }
+
+            _scaler = new EwmaScaler(dim: FeatureDim, halfLifeBars: ScalerHalfLife);
+            _alphaW = 1.0 - Math.Exp(Math.Log(0.5) / Math.Max(1, HLWeights));
+            _alphaForget = 1.0 - Math.Exp(Math.Log(0.5) / Math.Max(1, HLForget));
+
+            if (EnableConfSizing && SizingRMinPct > SizingRMaxPct)
+            {
+                double tmp = SizingRMinPct; SizingRMinPct = SizingRMaxPct; SizingRMaxPct = tmp;
+            }
+
+            if (!EnsureEnsembleReady()) { Err("Init ensemble invalide."); Stop(); return; }
+
+            if (TbHmax < HorizonBars) TbHmax = HorizonBars;
+
+            Positions.Opened += OnOpened;
+            Positions.Closed += OnClosed;
+
+            _cumPnL = 0.0; _peakPnL = 0.0; _maxDD = 0.0; _eq0 = Account.Equity;
+
+            Print($"[INIT] {Label} | Sym={SymbolName} TF={TimeFrame} D={RffDim} H={HorizonBars} Ensemble={EnsembleSize}");
+        }
+
+        // ===== Ensemble =====
+        private void BuildEnsembleSpecs()
+        {
+            var r = new Random(Seed);
+            var sigmas = ParseSigmas();
+            _specs = new List<EnsembleSpec>(EnsembleSize);
+
+            for (int i = 0; i < EnsembleSize; i++)
+            {
+                int k = Math.Min(FeatureDim, Math.Max(4, SubspaceK + (i % 2 == 0 ? 0 : 1)));
+                var featIdx = PickFeatIdx(r, FeatureDim, k);
+                double sigma = sigmas[i % sigmas.Length];
+
+                double lr_i = Lr * Math.Sqrt(Math.Max(1, SubspaceK) / (double)k) * Math.Sqrt(RefRffDim / Math.Max(1.0, RffDim));
+                double l2_i = (lr_i > 0) ? Lambda * (Lr / lr_i) : Lambda;
+
+                _specs.Add(new EnsembleSpec
+                {
+                    FeatIdx = featIdx,
+                    Sigma = sigma,
+                    Lr = lr_i,
+                    L2 = l2_i,
+                    Seed = Seed + 100 * i,
+                    Ksub = k
+                });
+            }
+        }
+
+        private void InitModels()
+        {
+            _ms = new List<ModelState>(EnsembleSize);
+            foreach (var sp in _specs)
+            {
+                var m = new OnlineRffLogit(
+                    inputDim: sp.FeatIdx.Length, rffDim: RffDim,
+                    seed: sp.Seed, lr: sp.Lr, lambda: sp.L2,
+                    sigma: sp.Sigma, b1: AdamB1, b2: AdamB2, eps: AdamEps
+                );
+                _ms.Add(new ModelState
+                {
+                    M = m,
+                    Cal = new TempCalibrator(TempInit, TempLr, TempTmin, TempTmax),
+                    FeatIdx = sp.FeatIdx,
+                    Sigma = sp.Sigma,
+                    Ksub = sp.Ksub
+                });
+            }
+        }
+
+        private bool EnsureEnsembleReady(bool log = true)
+        {
+            try
+            {
+                if (_ms != null && _ms.Count == EnsembleSize) return true;
+                if (_specs == null || _specs.Count != EnsembleSize) BuildEnsembleSpecs();
+                InitModels();
+                return _ms != null && _ms.Count == EnsembleSize;
+            }
+            catch (Exception ex) { if (log) Err("EnsureEnsembleReady: " + ex.Message); return false; }
+        }
+
+        private int[] PickFeatIdx(Random r, int dim, int k)
+            => Enumerable.Range(0, dim).OrderBy(_ => r.Next()).Take(k).OrderBy(i => i).ToArray();
+
+        private double[] ParseSigmas()
+        {
+            var seps = new[] { ',', ';', ' ' };
+            return RffSigmasCsv.Split(seps, StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => double.Parse(s.Trim(), CultureInfo.InvariantCulture)).ToArray();
+        }
+
+        // ===== OnBar =====
+        protected override void OnBar()
+        {
+            try
+            {
+                int t = Bars.Count - 1;
+
+                FlushTBLabels(t);
+                FlushHLabels(t);
+
+                double price = Bars.ClosePrices[t];
+                double atrPx = Math.Max(_atr.Result[t], Symbol.PipSize * 0.5);
+                double spreadPx = Symbol.Spread * Symbol.PipSize;
+                double sprOverAtr = spreadPx / atrPx;
+
+                if (t < WarmupBars) { EnqueueTB_FromDecision(price, atrPx, t, null, null, null); return; }
+                if (!EnsureEnsembleReady()) { EnqueueTB_FromDecision(price, atrPx, t, null, null, null); return; }
+                if (sprOverAtr > MaxSpreadToAtr) { _blkSpread++; EnqueueTB_FromDecision(price, atrPx, t, null, null, null); return; }
+
+                if (!TryGetFeatures(t, out var xRaw, out _))
+                { _blkWarm++; EnqueueTB_FromDecision(price, atrPx, t, null, null, null); return; }
+
+                var x = _scaler.Transform(xRaw);
+                _scaler.UpdateOnly(xRaw);
+
+                var zList = new double[EnsembleSize][];
+                var sList = new double[EnsembleSize];
+                var pList = new double[EnsembleSize];
+
+                for (int i = 0; i < EnsembleSize; i++)
+                {
+                    var st = _ms[i];
+                    var xSub = st.FeatIdx.Select(idx => x[idx]).ToArray();
+                    var z = st.M.Transform(xSub);
+                    zList[i] = z;
+                    double s = st.M.PredictLogit(z);
+                    sList[i] = s;
+                    pList[i] = st.Cal.CalibratedProb(s);
+                }
+
+                // >>> Enquille AUC AVANT les gates (utilise l'agrégat pondéré actuel)
+                double[] wNow = ComputeWeights();
+                double phatAgg = 0.0; for (int i = 0; i < EnsembleSize; i++) phatAgg += wNow[i] * pList[i];
+                _hq.Enqueue(new PendingH(t, phatAgg));
+                while (_hq.Count > (1 << 17)) _hq.Dequeue();
+                // <<<
+
+                // Gates d'incertitude
+                double pMean = pList.Average();
+                double pVar = pList.Select(p => (p - pMean) * (p - pMean)).Average();
+                int buyCnt = pList.Count(p => p > 0.5);
+                int sellCnt = pList.Count(p => p < 0.5);
+                bool consensusOK = Math.Max(buyCnt, sellCnt) >= Math.Max(1, Math.Min(ConsensusK, EnsembleSize));
+                double ent = Entropy(pMean);
+
+                if (pVar > MaxVarP || !consensusOK || ent > MaxEntropy)
+                { _blkMargin++; EnqueueTB_FromDecision(price, atrPx, t, zList, sList, pList); return; }
+
+                // Edge & seuil dynamique (filtre de sélectivité Phase1_Simple)
+                double edge = Math.Abs(phatAgg - 0.5);
+                _edgeHist.Add(edge);
+                if (_edgeHist.Count > EdgeWindow) _edgeHist.RemoveRange(0, _edgeHist.Count - EdgeWindow);
+
+                double aucFactor = Clamp(1.0 + 2.5 * (_aucEma - 0.55), 0.6, 1.4);
+                double frac = Clamp(EdgeTopFrac * aucFactor, 0.05, 0.60);
+                double thrEdge = (_edgeHist.Count < 50) ? 0.0 : Percentile(_edgeHist, 1.0 - frac);
+
+                int updatesAvg = (int)Math.Round(_ms.Average(ms => (double)ms.M.Updates));
+                int barsSinceLast = (_lastTradeBar < 0) ? int.MaxValue : t - _lastTradeBar;
+
+                if (barsSinceLast < CooldownBars)
+                { _blkCooldown++; EnqueueTB_FromDecision(price, atrPx, t, zList, sList, pList); return; }
+
+                double pt = _fp.ATR_Ptile_252[t];
+                bool ptValid = !double.IsNaN(pt);
+                double dynFactor = ptValid ? (pt >= 70 ? 0.8 : (pt <= 30 ? 1.2 : 1.0)) : 1.0;
+                double marginCfg = Margin * dynFactor;
+                double marginNow = (updatesAvg < ColdUpdates) ? 0.0 : marginCfg;
+
+                bool passEdge = edge >= thrEdge;
+                bool buyCond = phatAgg > 0.5 + marginNow;
+                bool sellCond = phatAgg < 0.5 - marginNow;
+                if (!(passEdge && (buyCond || sellCond)))
+                { _blkMargin++; EnqueueTB_FromDecision(price, atrPx, t, zList, sList, pList); return; }
+
+                var side = buyCond ? TradeType.Buy : TradeType.Sell;
+
+                // Confiance & sizing
+                double scoreNew = SignalScore(phatAgg, marginNow);
+                _lastStrengthForOpen = scoreNew;
+
+                double conf01 = Math.Min(1.0, Math.Max(0.0,
+                                   (Math.Abs(phatAgg - 0.5) - marginNow) / Math.Max(1e-6, SizingScoreMax)));
+                double riskPctNow = EnableConfSizing
+                    ? (SizingRMinPct + (SizingRMaxPct - SizingRMinPct) * conf01)
+                    : RiskPercent;
+
+                // Close positions opposées
+                var ours = Positions.Where(IsOur).ToList();
+                foreach (var pos in ours.ToArray())
+                {
+                    if ((pos.TradeType == TradeType.Buy && side == TradeType.Sell) ||
+                        (pos.TradeType == TradeType.Sell && side == TradeType.Buy))
+                        pos.Close();
+                }
+
+                // Cap max + remplacement
+                ours = Positions.Where(IsOur).ToList();
+                if (ours.Count >= MaxOpenPositions)
+                {
+                    var worst = ours.OrderBy(p0 => _meta.TryGetValue((long)p0.Id, out var m0) ? m0.StrengthAtOpen : 0.0).FirstOrDefault();
+                    double worstEdge = (worst != null && _meta.TryGetValue((long)worst.Id, out var mw)) ? mw.StrengthAtOpen : 0.0;
+
+                    if (scoreNew <= worstEdge + ReplaceEps)
+                    { _blkMax++; EnqueueTB_FromDecision(price, atrPx, t, zList, sList, pList); return; }
+                    worst?.Close();
+                }
+
+                // EV net (coûts)
+                double slPips = SlAtrMult * atrPx / Symbol.PipSize;
+                double tpPips = TpOverSl * slPips;
+                double rRR = TpOverSl;
+
+                double slipPxRt = 2.0 * SlipPipsPerSide * Symbol.PipSize;
+                double feesPxRt = FeesPipsRoundtrip * Symbol.PipSize;
+                double costPxRt = spreadPx + slipPxRt + feesPxRt;
+
+                double slPx = Math.Max(1e-9, slPips * Symbol.PipSize);
+                double costR = costPxRt / slPx;
+
+                double q = buyCond ? phatAgg : (1.0 - phatAgg);
+                double evNet = q * rRR - (1.0 - q) - costR;
+                if (evNet <= EvGateAlphaR)
+                { _blkEV++; EnqueueTB_FromDecision(price, atrPx, t, zList, sList, pList); return; }
+
+#pragma warning disable 618
+                long volUnits = UnitsFromRisk(slPips, riskPctNow);
+#pragma warning restore 618
+                if (volUnits < Symbol.VolumeInUnitsMin)
+                { _blkVol++; EnqueueTB_FromDecision(price, atrPx, t, zList, sList, pList); return; }
+
+#pragma warning disable 618
+                var res = ExecuteMarketOrder(side, SymbolName, volUnits, Label, slPips, tpPips);
+#pragma warning restore 618
+                if (res != null && res.IsSuccessful)
+                { _lastTradeBar = t; if (side == TradeType.Buy) _ordBuy++; else _ordSell++; }
+                else { _ordFail++; }
+
+                EnqueueTB_FromDecision(price, atrPx, t, zList, sList, pList);
+            }
+            catch (Exception ex) { Err("OnBar: " + ex.Message); }
+        }
+
+        // ===== AUC labelling (H bars plus tard) =====
+        private void FlushHLabels(int tNow)
+        {
+            while (_hq.Count > 0)
+            {
+                var q = _hq.Peek();
+                if (q.Tdec + HorizonBars > tNow) break;
+                _hq.Dequeue();
+
+                double r = Bars.ClosePrices[tNow] - Bars.ClosePrices[q.Tdec];
+                int y = r > 0 ? 1 : 0;
+                double p = Math.Min(0.999999, Math.Max(0.0, q.P));
+
+                _samples.Add(new Sample { P = p, Y = y, T = Bars.OpenTimes[tNow], Bar = q.Tdec });
+                if (_samples.Count > (1 << 20)) _samples.RemoveRange(0, _samples.Count - (1 << 20));
+
+                var (_, last) = SplitFirstLast();
+                double aL = AucFromList(last);
+                double alpha = 0.02;
+                _aucEma = (1 - alpha) * _aucEma + alpha * aL;
+            }
+        }
+
+        private (List<Sample> first, List<Sample> last) SplitFirstLast()
+        {
+            if (_samples.Count == 0) return (new List<Sample>(), new List<Sample>());
+            var a = _samples.OrderBy(s => s.T).ToList();
+            int mid = a.Count / 2;
+            return (a.GetRange(0, mid), a.GetRange(mid, a.Count - mid));
+        }
+
+        private static int Bin(double p)
+        {
+            if (double.IsNaN(p)) return -1;
+            p = Math.Min(0.999999, Math.Max(0.0, p));
+            return (int)Math.Floor(p * AUC_BINS);
+        }
+
+        private static double AucFromList(List<Sample> s)
+        {
+            if (s == null || s.Count < 100) return 0.5;
+            long[] hP = new long[AUC_BINS], hN = new long[AUC_BINS];
+            long P = 0, N = 0;
+            foreach (var e in s)
+            {
+                int b = Bin(e.P); if (b < 0) continue;
+                if (e.Y == 1) { hP[b]++; P++; } else { hN[b]++; N++; }
+            }
+            if (P < 25 || N < 25) return 0.5;
+            long cumN = 0; double mw = 0;
+            for (int k = 0; k < AUC_BINS; k++)
+            {
+                mw += hP[k] * (cumN + 0.5 * hN[k]);
+                cumN += hN[k];
+            }
+            return mw / (double)(P * N);
+        }
+
+        // ===== TB enqueue / flush =====
+        private void EnqueueTB_FromDecision(double price, double atrPx, int tDecision,
+                                            double[][] zList, double[] sList, double[] pList)
+        {
+            _tbq.Enqueue(new PendingTB
+            {
+                ZtList = zList != null ? zList.Select(z => (double[])z.Clone()).ToArray() : null,
+                Slist = sList != null ? (double[])sList.Clone() : null,
+                PcalList = pList != null ? (double[])pList.Clone() : null,
+                Up = price + TbUpAtr * atrPx,
+                Dn = price - TbDnAtr * atrPx,
+                Expire = (Bars.Count - 1) + TbHmax,
+                DecisionBar = tDecision,
+                Done = false
+            });
+            while (_tbq.Count > 8192) _tbq.Dequeue();
+        }
+
+        private void FlushTBLabels(int tNow)
+        {
+            int n = _tbq.Count;
+            for (int i = 0; i < n; i++)
+            {
+                var ex = _tbq.Dequeue();
+                if (ex.Done) continue;
+
+                if (ex.ZtList == null || ex.PcalList == null)
+                { ex.Done = true; _modelSkipped++; continue; }
+
+                bool hitUp = Bars.HighPrices[tNow] >= ex.Up;
+                bool hitDn = Bars.LowPrices[tNow] <= ex.Dn;
+                bool expired = tNow >= ex.Expire;
+
+                bool valid = (hitUp ^ hitDn) || expired;
+                if (!valid) { _tbq.Enqueue(ex); continue; }
+
+                if (expired && TbSkipOnExpire)
+                { ex.Done = true; _modelExpired++; continue; }
+
+                double y = expired ? 0.5 : (hitUp ? 1.0 : 0.0);
+
+                // Pondération temporelle (simple, PH1)
+                double wTime = LabelTimeWeight(tNow, ex.DecisionBar, ex.Expire, expired);
+
+                // Désaccord conservateur basé sur la variance des p_cal du comité au moment de la décision
+                double pMeanDec = ex.PcalList.Average();
+                double pVarDec = ex.PcalList.Select(pp => (pp - pMeanDec) * (pp - pMeanDec)).Average();
+                // pénalise exponentiellement la variance ; à MaxVarP => ~e^-1
+                double wDis = Math.Exp(-pVarDec / Math.Max(1e-9, MaxVarP));
+
+                // Bonus binaire Payoff (si TP atteint, léger boost ; si SL, léger malus ; expire neutre)
+                double wPay = expired ? 1.0 : (hitUp ? 1.15 : 0.85);
+
+                for (int m = 0; m < EnsembleSize; m++)
+                {
+                    var st = _ms[m];
+                    st.M.DecayWeights(_alphaForget);
+
+                    double p_dec = ex.PcalList[m];
+                    double err = Math.Abs(p_dec - y);             // correction d'erreur
+                    double wErr = 0.5 + 1.5 * err;                // dans [0.5, 2.0]
+
+                    // Pondération finale (bornée)
+                    double wLab = Clamp(wTime * wDis * wPay * wErr, 0.05, 3.0);
+
+                    for (int k = 0; k < UpdatesPerLabel; k++)
+                        st.M.UpdateWeighted(ex.ZtList[m], y, wLab, clipL2: GradClip);
+
+                    // Suivi Brier & EV pour l'agrégateur
+                    double brier = (p_dec - y) * (p_dec - y);
+                    st.BrierEma = (1.0 - _alphaW) * st.BrierEma + _alphaW * brier;
+
+                    double evR = expired ? 0.0 : (hitUp ? TpOverSl : -1.0);
+                    st.EvEma = (1.0 - _alphaW) * st.EvEma + _alphaW * evR;
+
+                    if (!expired && ex.Slist != null) st.Cal.Update(ex.Slist[m], y);
+                    st.LabelsSeen++;
+                }
+
+                ex.Done = true;
+                if (expired) _modelExpired++; else _modelHit++;
+            }
+        }
+
+        private double LabelTimeWeight(int tNow, int tDec, int tExp, bool expired)
+        {
+            if (expired) return 0.3;
+            int dt = Math.Max(1, tNow - tDec);
+            int hmax = Math.Max(1, tExp - tDec);
+            double beta = 2.0;
+            return Math.Exp(-beta * dt / hmax);
+        }
+
+        // ===== Features =====
+        private bool TryGetFeatures(int t, out double[] xRaw, out string reason)
+        {
+            xRaw = null; reason = null;
+            if (_fp == null) { reason = "FeaturePack null"; return false; }
+            try
+            {
+                double f0 = _fp.STFT_lo_32[t];
+                double f1 = _fp.STFT_hi_64[t];
+                double f2 = _fp.ATR_100_Z[t];
+                double f3 = _fp.BBW_50[t];
+                double f4 = _fp.ATR_Ptile_252[t];
+                double f5 = _fp.LogRet_20[t];
+                double f6 = _fp.LogRet_50[t];
+                double f7 = _fp.LogRet_100[t];
+                double f8 = _fp.ADX_14[t];
+                double f9 = _fp.ADX_Slope_14_10[t];
+                double f10 = _fp.LR_Slope_20_ATR14[t];
+                double f11 = _fp.LR_Slope_50_ATR14[t];
+                double f12 = _fp.LR_SlopeROC1_50_ATR14[t];
+                double f13 = _fp.Dist_DEMA20_ATR14[t];
+                double f14 = _fp.Dist_KAMA50_ATR14[t];
+                double f15 = _fp.Dist_EMA100_ATR14[t];
+                double f16 = _fp.MACD_Hist_ATR14[t];
+                double f17 = _fp.Donch_PctB_20[t];
+                double f18 = _fp.Range_ATR14[t];
+                double f19 = _fp.VolRetStd_20[t];
+                double f20 = _fp.VolRetStd_100[t];
+                double f21 = _fp.VolRatio_20_100[t];
+                double f22 = _fp.SkewRet_20[t];
+                double f23 = _fp.KurtRet_20[t];
+                double f24 = _fp.MTF_W_VWAP_ATR14[t];
+
+                xRaw = new[] { f0,f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13,f14,f15,f16,f17,f18,f19,f20,f21,f22,f23,f24 };
+                if (xRaw.Any(v => double.IsNaN(v) || double.IsInfinity(v))) { reason = "NaN/Inf features"; return false; }
+                return true;
+            }
+            catch { reason = "Index/field null"; return false; }
+        }
+
+        // ===== Fitness (points entiers) =====
+        protected override double GetFitness(GetFitnessArgs args)
+        {
+            var (first, last) = SplitFirstLast();
+            if (last.Count < 200 || first.Count < 100) return 0.0;
+
+            double aL = AucFromList(last);
+            double aF = AucFromList(first);
+
+            int Ntr = _trades.Count;
+            if (Ntr < 20) return 0.0;
+
+            var s = _trades.OrderBy(t => t.Close).ToList();
+            if (s.Count == 0) return 0.0;
+
+            int monthsAll = s.GroupBy(t => t.MonthKey).Count();
+            int burnTrades = Math.Min(40, Math.Max(10, (int)Math.Round(0.15 * Ntr)));
+            int burnMonths = Math.Min(2, Math.Max(1, (int)Math.Round(0.15 * Math.Max(1, monthsAll))));
+
+            DateTime t0 = s.First().Close;
+            DateTime tCut = t0.AddMonths(burnMonths);
+            int idxM = s.FindIndex(t => t.Close >= tCut); if (idxM < 0) idxM = s.Count;
+            int idx = Math.Min(s.Count, Math.Max(burnTrades, idxM));
+
+            var pre = s.Take(idx).ToList();
+            var post = s.Skip(idx).ToList();
+            var used = (post.Count >= 10) ? post : s;
+
+            double eqStart = _eq0 + pre.Sum(x => x.NetProfit);
+            var (ddPct, pf, _, _) = RiskPF(used, eqStart);
+
+            int ptsAUC      = ClampInt((int)Math.Round(500.0 * Math.Max(0.0, aL - 0.50)), 0, 50);
+            int ptsAUCgain  = ClampInt((int)Math.Round(500.0 * Math.Max(0.0, Math.Min(0.02, aL - aF))), 0, 10);
+            int ptsPF       = ClampInt((int)Math.Round(30.0 * SmoothStep(pf, 1.00, 1.60)), 0, 30);
+            int ptsDD       = ClampInt((int)Math.Round(30.0 * SmoothStep(0.10 - ddPct, 0.00, 0.05)), 0, 30);
+
+            int monthsUsed  = used.GroupBy(z => z.MonthKey).Count();
+            double covTrades = SmoothStep(used.Count, 30.0, 120.0);
+            double covMonths = SmoothStep(monthsUsed, 2.0, 6.0);
+            int ptsCOV      = ClampInt((int)Math.Round(20.0 * Math.Sqrt(Math.Max(0.0, covTrades * covMonths))), 0, 20);
+
+            int scorePoints = ptsAUC + ptsAUCgain + ptsPF + ptsDD + ptsCOV;
+            return (double)scorePoints;
+        }
+
+        private static int ClampInt(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
+
+        private static double SmoothStep(double x, double lo, double hi)
+        {
+            if (x <= lo) return 0.0;
+            if (x >= hi) return 1.0;
+            double u = (x - lo) / Math.Max(1e-9, hi - lo);
+            return u * u * (3.0 - 2.0 * u);
+        }
+
+        private static List<double> EquityFrom(IEnumerable<TradeRec> trades, double eq0)
+        {
+            double eq = eq0; var e = new List<double>();
+            foreach (var tr in trades.OrderBy(t => t.Close)) { eq += tr.NetProfit; e.Add(eq); }
+            return e;
+        }
+
+        private static (double ddPct, double pf, int nPos, int nNeg) RiskPF(List<TradeRec> used, double eq0)
+        {
+            if (used == null || used.Count == 0) return (0.0, 0.0, 0, 0);
+            var e = EquityFrom(used, eq0);
+            double peak = eq0, ddMaxPct = 0.0;
+            foreach (var v in e)
+            {
+                if (v > peak) peak = v;
+                if (peak > 0) ddMaxPct = Math.Max(ddMaxPct, (peak - v) / peak);
+            }
+            double gains = used.Where(x => x.NetProfit > 0).Sum(x => x.NetProfit);
+            double losses = used.Where(x => x.NetProfit < 0).Sum(x => -x.NetProfit);
+            double pf = (losses > 0) ? gains / losses : (gains > 0 ? 5.0 : 0.0);
+            int nPos = used.Count(x => x.NetProfit > 0), nNeg = used.Count(x => x.NetProfit < 0);
+            return (ddMaxPct, pf, nPos, nNeg);
+        }
+
+        // ===== Utils =====
+        private bool IsOur(Position p) => p.SymbolName == SymbolName && p.Label == Label;
+
+        private double SignalScore(double pCal, double marginNow)
+        {
+            double s = Math.Abs(pCal - 0.5);
+            return s + 0.5 * Math.Max(0.0, s - marginNow);
+        }
+
+        private static double Clamp(double v, double lo, double hi) => v < lo ? lo : (v > hi ? hi : v);
+
+        private double Percentile(List<double> data, double q)
+        {
+            q = Clamp(q, 0.0, 1.0);
+            if (data == null || data.Count == 0) return 0.0;
+            var tmp = data.ToArray();
+            Array.Sort(tmp);
+            double pos = (tmp.Length - 1) * q;
+            int lo = (int)Math.Floor(pos);
+            int hi = (int)Math.Ceiling(pos);
+            if (lo == hi) return tmp[lo];
+            double w = pos - lo;
+            return tmp[lo] * (1 - w) + tmp[hi] * w;
+        }
+
+        private long UnitsFromRisk(double slPips, double riskPct)
+        {
+            double riskUsd = Account.Equity * (riskPct / 100.0);
+            double pipValuePerUnit = Symbol.PipValue / Symbol.LotSize;
+            double lossPerUnit = Math.Max(1e-9, slPips) * pipValuePerUnit;
+            double units = riskUsd / lossPerUnit;
+#pragma warning disable 618
+            double norm = Symbol.NormalizeVolumeInUnits(units, RoundingMode.Down);
+#pragma warning restore 618
+            if (norm < Symbol.VolumeInUnitsMin) norm = Symbol.VolumeInUnitsMin;
+            if (norm > Symbol.VolumeInUnitsMax) norm = Symbol.VolumeInUnitsMax;
+            return (long)Math.Round(norm);
+        }
+
+        private bool ShouldLog(int t) => LogEveryNBars > 0 && (t % LogEveryNBars) == 0;
+
+        // ===== Positions =====
+        protected override void OnTick()
+        {
+            double pt = _fp.ATR_Ptile_252.LastValue;
+            bool ptValid = !double.IsNaN(pt);
+            double kTrail = ptValid ? (pt >= 70 ? 1.5 : (pt <= 30 ? 0.8 : 1.0)) : 1.0;
+
+            foreach (var pos in Positions)
+            {
+                if (!IsOur(pos)) continue;
+                if (!_meta.TryGetValue((long)pos.Id, out var m)) continue;
+
+                double close = pos.TradeType == TradeType.Buy ? Symbol.Bid : Symbol.Ask;
+                double movePips = pos.TradeType == TradeType.Buy
+                    ? (close - pos.EntryPrice) / Symbol.PipSize
+                    : (pos.EntryPrice - close) / Symbol.PipSize;
+
+                double r = movePips / Math.Max(1e-9, m.InitSlPips);
+                if (r > m.MaxR) { m.MaxR = r; _meta[(long)pos.Id] = m; }
+
+                int age = Bars.Count - 1 - m.EntryBar;
+                if (age >= MaxPosBars && r < 0.0) { pos.Close(); _meta.Remove((long)pos.Id); continue; }
+
+                if (EnablePartialTP1R && !m.TookTP1 && r >= 1.0)
+                {
+#pragma warning disable 618
+                    long half = (long)Symbol.NormalizeVolumeInUnits(pos.VolumeInUnits / 2.0, RoundingMode.Down);
+#pragma warning restore 618
+                    if (half >= Symbol.VolumeInUnitsMin && half < pos.VolumeInUnits)
+                    {
+#pragma warning disable 618
+                        var cr = ClosePosition(pos, half);
+#pragma warning restore 618
+                        if (cr.IsSuccessful) { m.TookTP1 = true; _meta[(long)pos.Id] = m; }
+                    }
+                }
+
+                double? newSL = pos.StopLoss;
+                if (!m.BeDone && r >= 1.0) { newSL = pos.EntryPrice; m.BeDone = true; }
+
+                if (r >= 1.4)
+                {
+                    double atrNow = _atr.Result.LastValue;
+                    double cand = pos.TradeType == TradeType.Buy ? Symbol.Bid - kTrail * atrNow : Symbol.Ask + kTrail * atrNow;
+                    if (pos.StopLoss.HasValue)
+                        newSL = pos.TradeType == TradeType.Buy ? Math.Max(pos.StopLoss.Value, cand)
+                                                               : Math.Min(pos.StopLoss.Value, cand);
+                    else newSL = cand;
+                }
+
+#pragma warning disable 618
+                if (newSL != pos.StopLoss) ModifyPosition(pos, newSL, pos.TakeProfit);
+#pragma warning restore 618
+            }
+
+            var alive = new HashSet<long>(Positions.Where(IsOur).Select(p => (long)p.Id));
+            var toRm = _meta.Keys.Where(id => !alive.Contains(id)).ToList();
+            foreach (var id in toRm) _meta.Remove(id);
+        }
+
+        private void OnOpened(PositionOpenedEventArgs e)
+        {
+            if (e.Position.SymbolName != SymbolName || e.Position.Label != Label) return;
+
+            double slPips = Math.Abs(((e.Position.StopLoss ?? e.Position.EntryPrice) - e.Position.EntryPrice) / Symbol.PipSize);
+            double pipVal = Symbol.PipValue / Symbol.LotSize;
+            double riskAtOpen = Math.Max(1e-9, slPips) * pipVal * e.Position.VolumeInUnits;
+            double spreadPxOpen = Symbol.Spread * Symbol.PipSize;
+
+            _meta[(long)e.Position.Id] = new Meta
+            {
+                EntryBar = Bars.Count - 1,
+                InitSlPips = Math.Max(1e-9, slPips),
+                BeDone = false,
+                MaxR = 0.0,
+                TookTP1 = false,
+                StrengthAtOpen = _lastStrengthForOpen,
+                RiskAtOpenUsd = riskAtOpen,
+                SpreadAtOpenPx = spreadPxOpen
+            };
+        }
+
+        private void OnClosed(PositionClosedEventArgs e)
+        {
+            if (e.Position.SymbolName != SymbolName || e.Position.Label != Label) return;
+            long id = (long)e.Position.Id;
+
+            if (_meta.TryGetValue(id, out var _))
+            {
+                double net = e.Position.NetProfit;
+                var rec = new TradeRec
+                {
+                    Open = e.Position.EntryTime,
+                    Close = Server.Time,
+                    NetProfit = net,
+                    MonthKey = Server.Time.ToString("yyyy-MM")
+                };
+                _trades.Add(rec);
+
+                _cumPnL += net;
+                _peakPnL = Math.Max(_peakPnL, _cumPnL);
+                _maxDD = Math.Max(_maxDD, _peakPnL - _cumPnL);
+            }
+            _meta.Remove(id);
+        }
+
+        protected override void OnStop()
+        {
+            int t = Bars.Count - 1;
+            int bs = (_lastTradeBar < 0) ? int.MaxValue : t - _lastTradeBar;
+            int updatesAvg = 0;
+            try { if (_ms != null && _ms.Count > 0) updatesAvg = (int)Math.Round(_ms.Average(m => (double)m.M.Updates)); } catch { updatesAvg = 0; }
+
+            Print($"[SUMMARY] buy={_ordBuy} sell={_ordSell} fail={_ordFail} blocks: spr={_blkSpread} cooldown={_blkCooldown} margin={_blkMargin} warm={_blkWarm} max={_blkMax} vol={_blkVol} ev={_blkEV} updates_avg={updatesAvg} barsSinceLast={bs} tbq={_tbq?.Count ?? 0}");
+
+            var (first, last) = SplitFirstLast();
+            double aF = AucFromList(first), aL = AucFromList(last);
+            Print($"[PH1] samples={_samples.Count} AUC_first={aF:F6} AUC_last={aL:F6} AUC_ema={_aucEma:F6} hit={_modelHit} exp={_modelExpired} skip={_modelSkipped}");
+        }
+
+        // ===== Agrégateur =====
+        private double[] ComputeWeights()
+        {
+            const double cEV = 0.5;
+            double[] s = new double[EnsembleSize];
+            for (int i = 0; i < EnsembleSize; i++)
+            {
+                var st = _ms[i];
+                double b = Math.Min(0.99, Math.Max(0.0001, st.BrierEma));
+                double ev = st.EvEma;
+                double baseScore = (st.LabelsSeen < ColdStartLabels) ? 0.0 : (-b / Math.Max(1e-9, TauW) + cEV * ev);
+                s[i] = baseScore;
+            }
+            double maxS = s.Max();
+            double[] expArr = s.Select(v => Math.Exp(v - maxS)).ToArray();
+            double sum = Math.Max(1e-9, expArr.Sum());
+            double[] w = expArr.Select(v => v / sum).ToArray();
+            return w;
+        }
+
+        private static double Entropy(double pMean)
+        {
+            double p = Math.Max(1e-9, Math.Min(1 - 1e-9, pMean));
+            return -p * Math.Log(p) - (1 - p) * Math.Log(1 - p);
+        }
+    }
+
+    // ===== Online RFF Logistic Regression =====
+    internal sealed class OnlineRffLogit
+    {
+        private readonly int _inputDim;
+        private readonly int _rffDim;
+        private readonly double[,] _omega;
+        private readonly double[] _b;
+        private readonly double[] _w;
+        private readonly double[] _mw;
+        private readonly double[] _vw;
+        private double _c, _mc, _vc;
+        private readonly double _scale;
+        private readonly double _lambda;
+        private readonly double _b1, _b2, _eps, _wd;
+        private int _t;
+
+        private double _lr;
+
+        public int Updates { get; private set; }
+
+        public OnlineRffLogit(int inputDim, int rffDim, int seed, double lr, double lambda, double sigma = 1.0, double b1 = 0.9, double b2 = 0.999, double eps = 1e-8)
+        {
+            _inputDim = inputDim;
+            _rffDim = rffDim;
+            _lr = lr;
+            _lambda = lambda;
+            _b1 = b1; _b2 = b2; _eps = eps;
+            _wd = lambda; _t = 0;
+
+            _omega = new double[rffDim, inputDim];
+            _b = new double[rffDim];
+            _w = new double[rffDim];
+            _mw = new double[rffDim];
+            _vw = new double[rffDim];
+            _c = 0.0; _mc = 0.0; _vc = 0.0;
+            _scale = Math.Sqrt(2.0 / rffDim);
+
+            var rnd = new Random(seed);
+            for (int d = 0; d < rffDim; d++)
+            {
+                _b[d] = 2.0 * Math.PI * rnd.NextDouble();
+                for (int m = 0; m < _inputDim; m++) _omega[d, m] = NextGaussian(rnd, 0.0, 1.0 / Math.Max(1e-6, sigma));
+                _w[d] = NextGaussian(rnd, 0.0, 1e-2);
+            }
+        }
+
+        public double[] Transform(double[] x)
+        {
+            var z = new double[_rffDim];
+            for (int d = 0; d < _rffDim; d++)
+            {
+                double dot = 0.0;
+                for (int m = 0; m < _inputDim; m++) dot += _omega[d, m] * x[m];
+                z[d] = _scale * Math.Cos(dot + _b[d]);
+            }
+            return z;
+        }
+
+        public double PredictProb(double[] z) => Sigmoid(PredictLogit(z));
+
+        public double PredictLogit(double[] z)
+        {
+            double s = _c;
+            for (int d = 0; d < _rffDim; d++) s += _w[d] * z[d];
+            return s;
+        }
+
+        public static double Sigmoid(double x)
+        {
+            if (x >= 0) { double e = Math.Exp(-x); return 1.0 / (1.0 + e); }
+            else { double e = Math.Exp(x); return e / (1.0 + e); }
+        }
+
+        public void UpdateWeighted(double[] z, double y, double w, double clipL2 = double.PositiveInfinity)
+        {
+            double s = PredictLogit(z);
+            double p = Sigmoid(s);
+            double gCommon = w * (p - y);
+
+            double gc = gCommon;
+            double norm2 = gc * gc;
+            for (int d = 0; d < _rffDim; d++) norm2 += (gCommon * z[d]) * (gCommon * z[d]);
+
+            double scale = 1.0;
+            if (!double.IsInfinity(clipL2))
+            {
+                double n = Math.Sqrt(Math.Max(1e-16, norm2));
+                if (n > clipL2) scale = clipL2 / n;
+            }
+
+            _t++;
+            double b1t = 1.0 - Math.Pow(_b1, _t);
+            double b2t = 1.0 - Math.Pow(_b2, _t);
+
+            _mc = _b1 * _mc + (1.0 - _b1) * (scale * gc);
+            _vc = _b2 * _vc + (1.0 - _b2) * (scale * gc * scale * gc);
+            double mchat = _mc / Math.Max(1e-16, b1t);
+            double vchat = _vc / Math.Max(1e-16, b2t);
+            _c -= _lr * (mchat / (Math.Sqrt(vchat) + _eps));
+
+            for (int d = 0; d < _rffDim; d++)
+            {
+                double gw = scale * gCommon * z[d];
+                _mw[d] = _b1 * _mw[d] + (1.0 - _b1) * gw;
+                _vw[d] = _b2 * _vw[d] + (1.0 - _b2) * (gw * gw);
+                double mhat = _mw[d] / Math.Max(1e-16, b1t);
+                double vhat = _vw[d] / Math.Max(1e-16, b2t);
+                _w[d] -= _lr * (mhat / (Math.Sqrt(vhat) + _eps) + _wd * _w[d]);
+            }
+
+            Updates++;
+        }
+
+        public void DecayWeights(double rho)
+        {
+            double k = Math.Max(0.0, 1.0 - rho);
+            for (int d = 0; d < _rffDim; d++) _w[d] *= k;
+            _c *= k;
+        }
+
+        private static double NextGaussian(Random rnd, double mu, double sigma)
+        {
+            double u1 = 1.0 - rnd.NextDouble();
+            double u2 = 1.0 - rnd.NextDouble();
+            double r = Math.Sqrt(-2.0 * Math.Log(u1));
+            double theta = 2.0 * Math.PI * u2;
+            return mu + sigma * r * Math.Cos(theta);
+        }
+    }
+
+    // ===== EWMA Scaler =====
+    internal sealed class EwmaScaler
+    {
+        private readonly double[] _mu;
+        private readonly double[] _var;
+        private readonly double _alpha;
+        private const double EPS = 1e-8;
+
+        public EwmaScaler(int dim, int halfLifeBars = 500)
+        {
+            _mu = new double[dim];
+            _var = Enumerable.Repeat(1.0, dim).ToArray();
+            _alpha = 1.0 - Math.Exp(Math.Log(0.5) / Math.Max(1, halfLifeBars));
+        }
+
+        public void UpdateOnly(double[] x)
+        {
+            for (int i = 0; i < x.Length; i++)
+            {
+                double dx = x[i] - _mu[i];
+                _mu[i] += _alpha * dx;
+                _var[i] = (1.0 - _alpha) * _var[i] + _alpha * dx * dx;
+            }
+        }
+
+        public double[] Transform(double[] x)
+        {
+            var z = new double[x.Length];
+            for (int i = 0; i < x.Length; i++)
+            {
+                double s = Math.Sqrt(Math.Max(EPS, _var[i]));
+                z[i] = (x[i] - _mu[i]) / s;
+            }
+            return z;
+        }
+    }
+
+    // ===== TempCalibrator =====
+    internal sealed class TempCalibrator
+    {
+        public double T { get; private set; }
+        private readonly double _eta, _tmin, _tmax;
+
+        public TempCalibrator(double t0, double eta, double tmin, double tmax)
+        { T = t0; _eta = eta; _tmin = tmin; _tmax = tmax; }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static double Sigmoid(double x) => x >= 0 ? 1.0 / (1.0 + Math.Exp(-x))
+                                                          : Math.Exp(x) / (1.0 + Math.Exp(x));
+
+        public void Update(double s, double y)
+        {
+            if (double.IsNaN(s) || double.IsInfinity(s)) return;
+            double p = Sigmoid(s / T);
+            double g = (p - y) * (-s / Math.Max(1e-8, T * T));
+            T -= _eta * g;
+            if (T < _tmin) T = _tmin;
+            if (T > _tmax) T = _tmax;
+        }
+
+        public double CalibratedProb(double s)
+        {
+            if (double.IsNaN(s) || double.IsInfinity(s)) return 0.5;
+            return Sigmoid(s / T);
+        }
+    }
+}
+
+
