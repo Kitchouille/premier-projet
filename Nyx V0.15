@@ -88,6 +88,18 @@ namespace cAlgo.Robots
         [Parameter("ColdStart Labels", Group = "Model", DefaultValue = 50, MinValue = 10, MaxValue = 300)]
         public int ColdStartLabels { get; set; }
 
+        [Parameter("Model Reset Labels", Group = "Model", DefaultValue = 600, MinValue = 0, MaxValue = 5000, Step = 10)]
+        public int ModelResetLabels { get; set; }
+
+        [Parameter("Model Reset Brier", Group = "Model", DefaultValue = 0.40, MinValue = 0.05, MaxValue = 1.00)]
+        public double ModelResetBrier { get; set; }
+
+        [Parameter("Model Reset EV", Group = "Model", DefaultValue = -0.10, MinValue = -1.0, MaxValue = 1.0)]
+        public double ModelResetEv { get; set; }
+
+        [Parameter("Reseed On Reset", Group = "Model", DefaultValue = true)]
+        public bool ReseedOnReset { get; set; }
+
         // ===== Sélectivité =====
         [Parameter("EdgeTopFrac (top X%)", Group = "Selectivity", DefaultValue = 0.30, MinValue = 0.05, MaxValue = 0.60, Step = 0.01)]
         public double EdgeTopFrac { get; set; }
@@ -191,6 +203,7 @@ namespace cAlgo.Robots
 
         private List<EnsembleSpec> _specs;
         private List<ModelState> _ms;
+        private Random _resetRnd;
 
         // === AUC tracking ===
         private sealed class Sample { public double P; public int Y; public DateTime T; public int Bar; }
@@ -251,6 +264,8 @@ namespace cAlgo.Robots
             public double BrierEma = 0.25;
             public double EvEma = 0.0;
             public int LabelsSeen = 0;
+            public int BarsSinceReset = 0;
+            public int ResetCount = 0;
         }
 
         private void Err(string msg) { Print("[ERR] " + msg); }
@@ -267,6 +282,7 @@ namespace cAlgo.Robots
             _scaler = new EwmaScaler(dim: FeatureDim, halfLifeBars: ScalerHalfLife);
             _alphaW = 1.0 - Math.Exp(Math.Log(0.5) / Math.Max(1, HLWeights));
             _alphaForget = 1.0 - Math.Exp(Math.Log(0.5) / Math.Max(1, HLForget));
+            _resetRnd = new Random(unchecked(Seed * 7919 + 17));
 
             if (EnableConfSizing && SizingRMinPct > SizingRMaxPct)
             {
@@ -334,6 +350,51 @@ namespace cAlgo.Robots
             }
         }
 
+        private void ResetModel(int idx, bool resampleFeatures)
+        {
+            if (_ms == null || _specs == null) return;
+            if (idx < 0 || idx >= _ms.Count || idx >= _specs.Count) return;
+
+            if (_resetRnd == null) _resetRnd = new Random(unchecked(Seed * 7919 + 17));
+
+            var prevSpec = _specs[idx];
+            int[] featIdx = prevSpec.FeatIdx;
+            if (resampleFeatures)
+                featIdx = PickFeatIdx(_resetRnd, FeatureDim, prevSpec.Ksub);
+            else
+                featIdx = featIdx.ToArray();
+
+            int newSeed = resampleFeatures ? Math.Max(1, _resetRnd.Next(1, int.MaxValue)) : prevSpec.Seed;
+
+            var newSpec = new EnsembleSpec
+            {
+                FeatIdx = featIdx,
+                Sigma = prevSpec.Sigma,
+                Lr = prevSpec.Lr,
+                L2 = prevSpec.L2,
+                Seed = newSeed,
+                Ksub = prevSpec.Ksub
+            };
+
+            _specs[idx] = newSpec;
+
+            var st = _ms[idx];
+            st.M = new OnlineRffLogit(
+                inputDim: newSpec.FeatIdx.Length, rffDim: RffDim,
+                seed: newSpec.Seed, lr: newSpec.Lr, lambda: newSpec.L2,
+                sigma: newSpec.Sigma, b1: AdamB1, b2: AdamB2, eps: AdamEps
+            );
+            st.Cal = new TempCalibrator(TempInit, TempLr, TempTmin, TempTmax);
+            st.FeatIdx = newSpec.FeatIdx;
+            st.Sigma = newSpec.Sigma;
+            st.Ksub = newSpec.Ksub;
+            st.BrierEma = 0.25;
+            st.EvEma = 0.0;
+            st.LabelsSeen = 0;
+            st.BarsSinceReset = 0;
+            st.ResetCount++;
+        }
+
         private bool EnsureEnsembleReady(bool log = true)
         {
             try
@@ -362,6 +423,12 @@ namespace cAlgo.Robots
             try
             {
                 int t = Bars.Count - 1;
+
+                if (_ms != null)
+                {
+                    foreach (var st in _ms)
+                        st.BarsSinceReset++;
+                }
 
                 FlushTBLabels(t);
                 FlushHLabels(t);
@@ -644,6 +711,20 @@ namespace cAlgo.Robots
 
                     if (!expired && ex.Slist != null) st.Cal.Update(ex.Slist[m], y);
                     st.LabelsSeen++;
+
+                    string resetReason = null;
+                    if (ModelResetBrier > 0.0 && ModelResetBrier < 1.0 && st.LabelsSeen >= ColdStartLabels && st.BrierEma > ModelResetBrier)
+                        resetReason = $"brier>{ModelResetBrier:F3}";
+                    if (resetReason == null && ModelResetEv > -1.0 && st.LabelsSeen >= ColdStartLabels && st.EvEma < ModelResetEv)
+                        resetReason = $"ev<{ModelResetEv:F3}";
+                    if (resetReason == null && ModelResetLabels > 0 && st.LabelsSeen >= ModelResetLabels)
+                        resetReason = $"age>={ModelResetLabels}";
+
+                    if (resetReason != null)
+                    {
+                        Print($"[MODEL_RESET] idx={m} reason={resetReason} labels={st.LabelsSeen} bars={st.BarsSinceReset} brier={st.BrierEma:F4} ev={st.EvEma:F4} resample={ReseedOnReset} next={st.ResetCount + 1}");
+                        ResetModel(m, ReseedOnReset);
+                    }
                 }
 
                 ex.Done = true;
