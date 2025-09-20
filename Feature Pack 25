@@ -1,0 +1,437 @@
+using System;
+using System.Linq;
+using System.Collections.Generic;
+using cAlgo;
+using cAlgo.API;
+using cAlgo.API.Indicators;
+
+/*
+ * KNNFeaturePack_25
+ * 25 features robustes, calculs stabilisés, NaN pendant le warm-up.
+ * Noms de sorties alignés sur le tableau demandé.
+ */
+
+namespace cAlgo.Indicators
+{
+    [Indicator(IsOverlay = false, TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class KNNFeaturePack_25 : Indicator
+    {
+        // ===== Paramètres =====
+        [Parameter("ATR14", DefaultValue = 14, MinValue = 5, MaxValue = 100)]
+        public int Atr14P { get; set; }
+
+        [Parameter("ATR Z LB", DefaultValue = 100, MinValue = 20, MaxValue = 500)]
+        public int AtrZLB { get; set; }
+
+        [Parameter("BB Period", DefaultValue = 50, MinValue = 10, MaxValue = 200)]
+        public int BbP { get; set; }
+
+        [Parameter("BB StdDev", DefaultValue = 2.0, MinValue = 1.0, MaxValue = 4.0)]
+        public double BbK { get; set; }
+
+        [Parameter("ADX Period", DefaultValue = 14, MinValue = 7, MaxValue = 50)]
+        public int AdxP { get; set; }
+
+        [Parameter("KAMA Period", DefaultValue = 50, MinValue = 10, MaxValue = 200)]
+        public int KamaP { get; set; }
+
+        [Parameter("KAMA Fast", DefaultValue = 2, MinValue = 1, MaxValue = 10)]
+        public int KamaFast { get; set; }
+
+        [Parameter("KAMA Slow", DefaultValue = 30, MinValue = 10, MaxValue = 100)]
+        public int KamaSlow { get; set; }
+
+        [Parameter("ATR Percentile Window", DefaultValue = 252, MinValue = 60, MaxValue = 1000)]
+        public int AtrPtWin { get; set; }
+
+        [Parameter("Donchian Period", DefaultValue = 20, MinValue = 10, MaxValue = 100)]
+        public int DonchP { get; set; }
+
+        // ===== Sorties (25) =====
+        [Output("STFT_lo_32")] public IndicatorDataSeries STFT_lo_32 { get; set; }              // 1
+        [Output("STFT_hi_64")] public IndicatorDataSeries STFT_hi_64 { get; set; }              // 2
+        [Output("ATR_100_Z")] public IndicatorDataSeries ATR_100_Z { get; set; }                // 3  (z-score ATR14 sur 100)
+        [Output("BBW_50")] public IndicatorDataSeries BBW_50 { get; set; }                      // 4
+        [Output("ATR_Ptile_252")] public IndicatorDataSeries ATR_Ptile_252 { get; set; }        // 5
+        [Output("LogRet_20")] public IndicatorDataSeries LogRet_20 { get; set; }                // 6
+        [Output("LogRet_50")] public IndicatorDataSeries LogRet_50 { get; set; }                // 7
+        [Output("LogRet_100")] public IndicatorDataSeries LogRet_100 { get; set; }              // 8
+        [Output("ADX_14")] public IndicatorDataSeries ADX_14 { get; set; }                      // 9
+        [Output("ADX_Slope_14_10")] public IndicatorDataSeries ADX_Slope_14_10 { get; set; }    // 10
+        [Output("LR_Slope_20_ATR14")] public IndicatorDataSeries LR_Slope_20_ATR14 { get; set; } // 11
+        [Output("LR_Slope_50_ATR14")] public IndicatorDataSeries LR_Slope_50_ATR14 { get; set; } // 12
+        [Output("LR_SlopeROC1_50_ATR14")] public IndicatorDataSeries LR_SlopeROC1_50_ATR14 { get; set; } // 13
+        [Output("Dist_DEMA20_ATR14")] public IndicatorDataSeries Dist_DEMA20_ATR14 { get; set; } // 14
+        [Output("Dist_KAMA50_ATR14")] public IndicatorDataSeries Dist_KAMA50_ATR14 { get; set; } // 15
+        [Output("Dist_EMA100_ATR14")] public IndicatorDataSeries Dist_EMA100_ATR14 { get; set; } // 16
+        [Output("MACD_Hist_ATR14")] public IndicatorDataSeries MACD_Hist_ATR14 { get; set; }    // 17
+        [Output("Donch_PctB_20")] public IndicatorDataSeries Donch_PctB_20 { get; set; }        // 18
+        [Output("Range_ATR14")] public IndicatorDataSeries Range_ATR14 { get; set; }            // 19
+        [Output("VolRetStd_20")] public IndicatorDataSeries VolRetStd_20 { get; set; }          // 20
+        [Output("VolRetStd_100")] public IndicatorDataSeries VolRetStd_100 { get; set; }        // 21
+        [Output("VolRatio_20_100")] public IndicatorDataSeries VolRatio_20_100 { get; set; }    // 22
+        [Output("SkewRet_20")] public IndicatorDataSeries SkewRet_20 { get; set; }              // 23
+        [Output("KurtRet_20")] public IndicatorDataSeries KurtRet_20 { get; set; }              // 24
+        [Output("MTF_W_VWAP_ATR14")] public IndicatorDataSeries MTF_W_VWAP_ATR14 { get; set; }  // 25
+
+        // ===== Indicateurs internes =====
+        private AverageTrueRange _atr14;
+        private BollingerBands _bb50;
+        private DirectionalMovementSystem _dms;
+        private ExponentialMovingAverage _ema20, _ema20_ema, _ema100;
+        private KaufmanAdaptiveMovingAverage _kama50;
+        private MacdHistogram _macd;
+
+        // ===== Buffers =====
+        private Queue<double> _atr14Hist;
+        private double _wPV = 0.0, _wV = 0.0;
+        private DateTime _weekStartNy = DateTime.MinValue;
+
+        private const double EPS = 1e-9;
+
+        protected override void Initialize()
+        {
+            _atr14 = Indicators.AverageTrueRange(Atr14P, MovingAverageType.Exponential);
+            _bb50  = Indicators.BollingerBands(Bars.ClosePrices, BbP, BbK, MovingAverageType.Simple);
+            _dms   = Indicators.DirectionalMovementSystem(AdxP);
+
+            _ema20 = Indicators.ExponentialMovingAverage(Bars.ClosePrices, 20);
+            _ema20_ema = Indicators.ExponentialMovingAverage(_ema20.Result, 20);
+            _ema100 = Indicators.ExponentialMovingAverage(Bars.ClosePrices, 100);
+
+            _kama50 = Indicators.KaufmanAdaptiveMovingAverage(Bars.ClosePrices, KamaP, KamaFast, KamaSlow);
+            _macd   = Indicators.MacdHistogram(Bars.ClosePrices, 12, 26, 9);
+
+            _atr14Hist = new Queue<double>(AtrPtWin + 4);
+        }
+
+        public override void Calculate(int i)
+        {
+            // Buffers qui avancent
+            double atr14Val = _atr14.Result[i];
+            _atr14Hist.Enqueue(atr14Val);
+            while (_atr14Hist.Count > AtrPtWin) _atr14Hist.Dequeue();
+
+            UpdateWeeklyAccums(i);
+
+            // Lookbacks
+            bool has1   = i >= 1;
+            bool has10  = i >= 10;
+            bool has20  = i >= 20;
+            bool has32  = i >= 32;
+            bool has50  = i >= 50;
+            bool has64  = i >= 64;
+            bool has100 = i >= 100;
+            bool has252 = _atr14Hist.Count >= AtrPtWin;
+
+            // 1/2) STFT
+            STFT_lo_32[i] = has32 ? Clamp01to10(StftPower(i, 32, 2, 6))   : double.NaN;
+            STFT_hi_64[i] = has64 ? Clamp01to10(StftPower(i, 64, 17, 31)) : double.NaN;
+
+            // 3) ATR_100_Z  (z-score de l'ATR14 sur 100 barres)
+            ATR_100_Z[i] = has100 ? RollingZ(_atr14.Result, i, 100) : double.NaN;
+
+            // 4) BBW_50 / MA
+            if (i >= BbP)
+            {
+                double ma = _bb50.Main[i];
+                BBW_50[i] = Math.Abs(ma) > EPS ? (_bb50.Top[i] - _bb50.Bottom[i]) / Math.Abs(ma) : double.NaN;
+            }
+            else BBW_50[i] = double.NaN;
+
+            // 5) ATR percentile 252
+            ATR_Ptile_252[i] = has252 ? PercentileRankQueue(_atr14Hist, atr14Val) : double.NaN;
+
+            // 6/7/8) Log returns
+            LogRet_20[i]  = has20  ? LogRetN(i, 20)  : double.NaN;
+            LogRet_50[i]  = has50  ? LogRetN(i, 50)  : double.NaN;
+            LogRet_100[i] = has100 ? LogRetN(i, 100) : double.NaN;
+
+            // 9) ADX level
+            ADX_14[i] = _dms.ADX[i];
+
+            // 10) ADX slope 10
+            ADX_Slope_14_10[i] = has10 ? (_dms.ADX[i] - _dms.ADX[i - 10]) / 10.0 : double.NaN;
+
+            // 11/12) LR slopes normalisés ATR14
+            LR_Slope_20_ATR14[i] = has20 ? LinRegSlopeClose(i, 20) / Math.Max(EPS, _atr14.Result[i]) : double.NaN;
+            LR_Slope_50_ATR14[i] = has50 ? LinRegSlopeClose(i, 50) / Math.Max(EPS, _atr14.Result[i]) : double.NaN;
+
+            // 13) ROC1 du slope 50 normalisé
+            if (has50 && i >= 51)
+            {
+                double sNow  = LinRegSlopeClose(i, 50);
+                double sPrev = LinRegSlopeClose(i - 1, 50);
+                LR_SlopeROC1_50_ATR14[i] = (sNow - sPrev) / Math.Max(EPS, _atr14.Result[i]);
+            }
+            else LR_SlopeROC1_50_ATR14[i] = double.NaN;
+
+            // 14) Dist_DEMA20_ATR14
+            if (i >= 20)
+            {
+                double dema20 = 2.0 * _ema20.Result[i] - _ema20_ema.Result[i];
+                Dist_DEMA20_ATR14[i] = (Bars.ClosePrices[i] - dema20) / Math.Max(EPS, _atr14.Result[i]);
+            }
+            else Dist_DEMA20_ATR14[i] = double.NaN;
+
+            // 15) Dist_KAMA50_ATR14
+            Dist_KAMA50_ATR14[i] = i >= KamaP
+                ? (Bars.ClosePrices[i] - _kama50.Result[i]) / Math.Max(EPS, _atr14.Result[i])
+                : double.NaN;
+
+            // 16) Dist_EMA100_ATR14
+            Dist_EMA100_ATR14[i] = has100
+                ? (Bars.ClosePrices[i] - _ema100.Result[i]) / Math.Max(EPS, _atr14.Result[i])
+                : double.NaN;
+
+            // 17) MACD hist normalisé ATR14
+            MACD_Hist_ATR14[i] = has1 ? _macd.Histogram[i] / Math.Max(EPS, _atr14.Result[i]) : double.NaN;
+
+            // 18) Donchian %B
+            if (i >= DonchP)
+            {
+                double hh = double.MinValue, ll = double.MaxValue;
+                for (int k = i - DonchP + 1; k <= i; k++)
+                {
+                    if (Bars.HighPrices[k] > hh) hh = Bars.HighPrices[k];
+                    if (Bars.LowPrices[k] < ll)  ll = Bars.LowPrices[k];
+                }
+                double den = Math.Max(EPS, hh - ll);
+                Donch_PctB_20[i] = (Bars.ClosePrices[i] - ll) / den;
+            }
+            else Donch_PctB_20[i] = double.NaN;
+
+            // 19) Range_ATR14
+            Range_ATR14[i] = (Bars.HighPrices[i] - Bars.LowPrices[i]) / Math.Max(EPS, _atr14.Result[i]);
+
+            // 20/21) Std dev des log-retours
+            VolRetStd_20[i]  = has20  ? StdDevRet(i, 20)  : double.NaN;
+            VolRetStd_100[i] = has100 ? StdDevRet(i, 100) : double.NaN;
+
+            // 22) Ratio vol 20/100
+            VolRatio_20_100[i] = (has100 && VolRetStd_100[i] > EPS) ? (VolRetStd_20[i] / VolRetStd_100[i]) : double.NaN;
+
+            // 23/24) Skew & Kurt sur 20
+            if (has20)
+            {
+                double skew, kurt;
+                SkewKurtRet(i, 20, out skew, out kurt);
+                SkewRet_20[i] = skew;
+                KurtRet_20[i] = kurt;
+            }
+            else { SkewRet_20[i] = double.NaN; KurtRet_20[i] = double.NaN; }
+
+            // 25) Weekly VWAP distance normalisée
+            {
+                double vwap = WeeklyVWAP(i);
+                MTF_W_VWAP_ATR14[i] = (Bars.ClosePrices[i] - vwap) / Math.Max(EPS, _atr14.Result[i]);
+            }
+        }
+
+        // ===== Helpers numériques =====
+        private double LogRetN(int i, int n)
+        {
+            int t0 = i - n;
+            if (t0 < 0) return double.NaN;
+            double c0 = Bars.ClosePrices[t0];
+            double c1 = Bars.ClosePrices[i];
+            if (c0 <= 0.0 || c1 <= 0.0) return double.NaN;
+            return Math.Log(c1 / c0);
+        }
+
+        private double StdDevRet(int i, int win)
+        {
+            if (i < win) return double.NaN;
+            double m = 0.0; int n = 0;
+            for (int k = i - win + 1; k <= i; k++)
+            {
+                if (k - 1 < 0) return double.NaN;
+                double c0 = Bars.ClosePrices[k - 1], c1 = Bars.ClosePrices[k];
+                if (c0 <= 0.0 || c1 <= 0.0) return double.NaN;
+                m += Math.Log(c1 / c0); n++;
+            }
+            m /= Math.Max(1, n);
+            double v = 0.0;
+            for (int k = i - win + 1; k <= i; k++)
+            {
+                double r = Math.Log(Bars.ClosePrices[k] / Bars.ClosePrices[k - 1]);
+                double d = r - m; v += d * d;
+            }
+            v = Math.Max(EPS, v / n);
+            return Math.Sqrt(v);
+        }
+
+        private void SkewKurtRet(int i, int win, out double skew, out double kurt)
+        {
+            skew = double.NaN; kurt = double.NaN;
+            if (i < win) return;
+
+            double[] r = new double[win]; int n = 0;
+            for (int k = i - win + 1; k <= i; k++)
+            {
+                double c0 = Bars.ClosePrices[k - 1], c1 = Bars.ClosePrices[k];
+                if (c0 <= 0.0 || c1 <= 0.0) return;
+                r[n++] = Math.Log(c1 / c0);
+            }
+            if (n < 3) return;
+
+            double m = r.Average();
+            double s2 = r.Select(x => (x - m) * (x - m)).Sum() / n;
+            double s = Math.Sqrt(Math.Max(EPS, s2));
+
+            double m3 = r.Select(x => Math.Pow((x - m) / s, 3.0)).Sum() / n;
+            double m4 = r.Select(x => Math.Pow((x - m) / s, 4.0)).Sum() / n;
+
+            skew = m3;
+            kurt = m4 - 3.0;
+        }
+
+        private double RollingZ(IndicatorDataSeries series, int i, int lb)
+        {
+            if (i < lb) return double.NaN;
+            double sum = 0.0;
+            for (int k = i - lb + 1; k <= i; k++) sum += series[k];
+            double m = sum / lb;
+
+            double v = 0.0;
+            for (int k = i - lb + 1; k <= i; k++) { double d = series[k] - m; v += d * d; }
+            v = Math.Max(EPS, v / lb);
+            return (series[i] - m) / Math.Sqrt(v);
+        }
+
+        private double LinRegSlopeClose(int i, int win)
+        {
+            if (i - win + 1 < 0) return double.NaN;
+            double sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (int k = 0; k < win; k++)
+            {
+                double x = k + 1;
+                double y = Bars.ClosePrices[i - win + 1 + k];
+                sx += x; sy += y; sxx += x * x; sxy += x * y;
+            }
+            double n = win;
+            double den = n * sxx - sx * sx;
+            if (Math.Abs(den) < EPS) return double.NaN;
+            return (n * sxy - sx * sy) / den;
+        }
+
+        // ===== STFT (log-retours centrés, Hamming, FFT radix-2) =====
+        private double StftPower(int j, int win, int kLo, int kHi)
+        {
+            if (j < win) return double.NaN;
+
+            double[] r = new double[win];
+            for (int k = 0; k < win; k++)
+            {
+                int t1 = j - (win - 1) + k;
+                int t0 = t1 - 1;
+                if (t0 < 0) return double.NaN;
+                double c0 = Bars.ClosePrices[t0];
+                double c1 = Bars.ClosePrices[t1];
+                if (c0 <= 0.0 || c1 <= 0.0) return double.NaN;
+                r[k] = Math.Log(c1 / c0);
+            }
+
+            double m = 0.0; for (int k = 0; k < win; k++) m += r[k]; m /= win;
+            double v = 0.0; for (int k = 0; k < win; k++) { double d = r[k] - m; r[k] = d; v += d * d; }
+            v = Math.Sqrt(Math.Max(EPS, v / win));
+
+            for (int k = 0; k < win; k++)
+                r[k] = (r[k] / v) * (0.5 * (1 - Math.Cos(2 * Math.PI * k / (win - 1))));
+
+            double[] re = new double[win], im = new double[win];
+            Array.Copy(r, re, win);
+            FftRadix2(re, im);
+
+            kLo = Math.Max(0, kLo);
+            kHi = Math.Min(win / 2, kHi);
+            if (kHi < kLo) return 0.0;
+
+            double pow = 0.0; int cnt = 0;
+            for (int k = kLo; k <= kHi; k++) { pow += re[k] * re[k] + im[k] * im[k]; cnt++; }
+            return cnt > 0 ? pow / cnt : 0.0;
+        }
+
+        private static void FftRadix2(double[] re, double[] im)
+        {
+            int n = re.Length;
+            for (int i = 1, j = 0; i < n; i++)
+            {
+                int bit = n >> 1;
+                for (; (j & bit) != 0; bit >>= 1) j &= ~bit;
+                j |= bit;
+                if (i < j)
+                {
+                    double tr = re[i]; re[i] = re[j]; re[j] = tr;
+                    double ti = im[i]; im[i] = im[j]; im[j] = ti;
+                }
+            }
+            for (int len = 2; len <= n; len <<= 1)
+            {
+                double ang = -2 * Math.PI / len;
+                double wlenRe = Math.Cos(ang), wlenIm = Math.Sin(ang);
+                for (int i = 0; i < n; i += len)
+                {
+                    double wRe = 1, wIm = 0;
+                    int half = len >> 1;
+                    for (int j = 0; j < half; j++)
+                    {
+                        int u = i + j, v = i + j + half;
+                        double tRe = re[v] * wRe - im[v] * wIm;
+                        double tIm = re[v] * wIm + im[v] * wRe;
+                        re[v] = re[u] - tRe; im[v] = im[u] - tIm;
+                        re[u] += tRe;        im[u] += tIm;
+                        double nwRe = wRe * wlenRe - wIm * wlenIm;
+                        wIm = wRe * wlenIm + wIm * wlenRe; wRe = nwRe;
+                    }
+                }
+            }
+        }
+
+        private static double Clamp01to10(double v)
+        {
+            if (double.IsNaN(v)) return double.NaN;
+            if (v < 0.0) return 0.0;
+            if (v > 10.0) return 10.0;
+            return v;
+        }
+
+        // ===== VWAP hebdo (NY) =====
+        private void UpdateWeeklyAccums(int i)
+        {
+            var ny = ToNY(Bars.OpenTimes[i]);
+            var ws = WeekStartNY(ny);
+            if (ws != _weekStartNy) { _weekStartNy = ws; _wPV = 0; _wV = 0; }
+            double tp = (Bars.HighPrices[i] + Bars.LowPrices[i] + Bars.ClosePrices[i]) / 3.0;
+            double vol = Math.Max(1.0, Bars.TickVolumes[i]);
+            _wPV += tp * vol; _wV += vol;
+        }
+
+        private double WeeklyVWAP(int i) => _wV > 0 ? _wPV / _wV : Bars.ClosePrices[i];
+
+        private DateTime ToNY(DateTime utc)
+        {
+            int y = utc.Year;
+            DateTime m1 = new DateTime(y, 3, 1); int d1 = (7 - (int)m1.DayOfWeek) % 7; DateTime dstStart = m1.AddDays(d1 + 7);
+            DateTime n1 = new DateTime(y, 11, 1); int d2 = (7 - (int)n1.DayOfWeek) % 7; DateTime dstEnd   = n1.AddDays(d2);
+            bool isDst = utc >= dstStart && utc < dstEnd;
+            return utc.AddHours(isDst ? -4 : -5);
+        }
+
+        private DateTime WeekStartNY(DateTime ny)
+        {
+            int dow = (int)ny.DayOfWeek; // Sunday = 0
+            int deltaToMonday = (dow == 0) ? -6 : (1 - dow);
+            return ny.Date.AddDays(deltaToMonday);
+        }
+
+        // ===== Stats util =====
+        private static double PercentileRankQueue(IEnumerable<double> q, double x)
+        {
+            int n = 0, le = 0;
+            foreach (var v in q) { n++; if (v <= x) le++; }
+            return n > 0 ? 100.0 * le / n : double.NaN;
+        }
+    }
+}
+
